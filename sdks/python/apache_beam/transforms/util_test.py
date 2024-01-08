@@ -784,6 +784,17 @@ class ReshuffleTest(unittest.TestCase):
           | beam.Map(lambda foobar: foobar.attr))
       assert_that(result, equal_to(['zab']))
 
+    # Test a streaming pipeline
+    options = PipelineOptions()
+    with beam.Pipeline(options=options) as p:
+      result = (
+          p
+          | beam.Create([FooBar('zab')], reshuffle=False)
+          | beam.WindowInto(window.SlidingWindows(1, 1))
+          | beam.Reshuffle()
+          | beam.Map(lambda foobar: foobar.attr))
+      assert_that(result, equal_to(['zab']))
+
   @pytest.mark.it_validatesrunner
   def test_reshuffle_preserves_timestamps(self):
     with TestPipeline() as pipeline:
