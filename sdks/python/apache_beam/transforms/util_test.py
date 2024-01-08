@@ -754,6 +754,36 @@ class ReshuffleTest(unittest.TestCase):
       assert_that(
           after_reshuffle, equal_to(expected_data), label='after reshuffle')
 
+  def test_reshuffle_with_coder_registry_data(self):
+    class FooBar:
+      def __init__(self, attr='no-attr-set'):
+        self.attr = attr
+
+      def __reduce__(self):
+        raise NotImplementedError("Unpicklable class")
+
+    class FooBarCoder(coders.Coder):
+      def encode(self, foobar) -> bytes:
+        return foobar.attr.encode('ascii')
+
+      def decode(self, foobar_bytes: bytes) -> FooBar:
+        return FooBar(foobar_bytes.decode('ascii'))
+
+      def is_deterministic(self):
+        return True
+
+      def to_type_hint(self):
+        return FooBar
+
+    beam.coders.registry.register_coder(FooBar, FooBarCoder)
+    with beam.Pipeline() as p:
+      result = (
+          p
+          | beam.Create([FooBar('zab')], reshuffle=False)
+          | beam.Reshuffle()
+          | beam.Map(lambda foobar: foobar.attr))
+      assert_that(result, equal_to(['zab']))
+
   @pytest.mark.it_validatesrunner
   def test_reshuffle_preserves_timestamps(self):
     with TestPipeline() as pipeline:
