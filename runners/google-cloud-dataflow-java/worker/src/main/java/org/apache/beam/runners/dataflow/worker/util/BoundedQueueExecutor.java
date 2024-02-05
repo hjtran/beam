@@ -119,6 +119,26 @@ public class BoundedQueueExecutor {
     return totalTimeMaxActiveThreadsUsed;
   }
 
+  public int activeCount() {
+    return activeCount.intValue();
+  }
+
+  public long bytesOutstanding() {
+    return bytesOutstanding;
+  }
+
+  public int elementsOutstanding() {
+    return elementsOutstanding;
+  }
+
+  public long maximumBytesOutstanding() {
+    return maximumBytesOutstanding;
+  }
+
+  public int maximumElementsOutstanding() {
+    return maximumElementsOutstanding;
+  }
+
   public String summaryHtml() {
     monitor.enter();
     try {

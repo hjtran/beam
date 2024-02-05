@@ -362,7 +362,7 @@ class Stage(object):
       return beam_runner_api_pb2.PTransform(
           unique_name=unique_name(None, self.name),
           spec=beam_runner_api_pb2.FunctionSpec(
-              urn='beam:runner:executable_stage:v1',
+              urn=common_urns.executable_stage,
               payload=exec_payload.SerializeToString()),
           inputs=named_inputs,
           outputs={
@@ -1346,6 +1346,7 @@ def lift_combiners(stages, context):
                 payload=transform.spec.payload),
             inputs=transform.inputs,
             outputs={'out': precombined_pcoll_id},
+            annotations=transform.annotations,
             environment_id=transform.environment_id))
 
     yield make_stage(
@@ -1355,6 +1356,7 @@ def lift_combiners(stages, context):
             spec=beam_runner_api_pb2.FunctionSpec(
                 urn=common_urns.primitives.GROUP_BY_KEY.urn),
             inputs={'in': precombined_pcoll_id},
+            annotations=transform.annotations,
             outputs={'out': grouped_pcoll_id}))
 
     yield make_stage(
@@ -1367,6 +1369,7 @@ def lift_combiners(stages, context):
                 payload=transform.spec.payload),
             inputs={'in': grouped_pcoll_id},
             outputs={'out': merged_pcoll_id},
+            annotations=transform.annotations,
             environment_id=transform.environment_id))
 
     yield make_stage(
@@ -1379,6 +1382,7 @@ def lift_combiners(stages, context):
                 payload=transform.spec.payload),
             inputs={'in': merged_pcoll_id},
             outputs=transform.outputs,
+            annotations=transform.annotations,
             environment_id=transform.environment_id))
 
   def unlifted_stages(stage):

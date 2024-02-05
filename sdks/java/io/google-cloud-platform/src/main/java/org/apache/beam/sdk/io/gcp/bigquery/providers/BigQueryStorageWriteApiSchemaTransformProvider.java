@@ -20,6 +20,7 @@ package org.apache.beam.sdk.io.gcp.bigquery.providers;
 import static org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Preconditions.checkArgument;
 import static org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Preconditions.checkNotNull;
 
+import com.google.api.services.bigquery.model.TableSchema;
 import com.google.auto.service.AutoService;
 import com.google.auto.value.AutoValue;
 import java.util.Arrays;
@@ -35,6 +36,8 @@ import org.apache.beam.sdk.io.gcp.bigquery.BigQueryIO.Write.WriteDisposition;
 import org.apache.beam.sdk.io.gcp.bigquery.BigQueryServices;
 import org.apache.beam.sdk.io.gcp.bigquery.BigQueryStorageApiInsertError;
 import org.apache.beam.sdk.io.gcp.bigquery.BigQueryUtils;
+import org.apache.beam.sdk.io.gcp.bigquery.DynamicDestinations;
+import org.apache.beam.sdk.io.gcp.bigquery.TableDestination;
 import org.apache.beam.sdk.io.gcp.bigquery.WriteResult;
 import org.apache.beam.sdk.io.gcp.bigquery.providers.BigQueryStorageWriteApiSchemaTransformProvider.BigQueryStorageWriteApiSchemaTransformConfiguration;
 import org.apache.beam.sdk.metrics.Counter;
@@ -56,6 +59,7 @@ import org.apache.beam.sdk.values.PCollection.IsBounded;
 import org.apache.beam.sdk.values.PCollectionRowTuple;
 import org.apache.beam.sdk.values.Row;
 import org.apache.beam.sdk.values.TypeDescriptors;
+import org.apache.beam.sdk.values.ValueInSingleWindow;
 import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.annotations.VisibleForTesting;
 import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Strings;
 import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.ImmutableMap;
@@ -81,6 +85,8 @@ public class BigQueryStorageWriteApiSchemaTransformProvider
   private static final String INPUT_ROWS_TAG = "input";
   private static final String FAILED_ROWS_TAG = "FailedRows";
   private static final String FAILED_ROWS_WITH_ERRORS_TAG = "FailedRowsWithErrors";
+  // magic string that tells us to write to dynamic destinations
+  protected static final String DYNAMIC_DESTINATIONS = "DYNAMIC_DESTINATIONS";
 
   @Override
   protected Class<BigQueryStorageWriteApiSchemaTransformConfiguration> configurationClass() {
@@ -96,6 +102,16 @@ public class BigQueryStorageWriteApiSchemaTransformProvider
   @Override
   public String identifier() {
     return String.format("beam:schematransform:org.apache.beam:bigquery_storage_write:v2");
+  }
+
+  @Override
+  public String description() {
+    return String.format(
+        "Writes data to BigQuery using the Storage Write API (https://cloud.google.com/bigquery/docs/write-api)."
+            + "\n\nThis expects a single PCollection of Beam Rows and outputs two dead-letter queues (DLQ) that "
+            + "contain failed rows. The first DLQ has tag [%s] and contains the failed rows. The second DLQ has "
+            + "tag [%s] and contains failed rows and along with their respective errors.",
+        FAILED_ROWS_TAG, FAILED_ROWS_WITH_ERRORS_TAG);
   }
 
   @Override
@@ -151,7 +167,11 @@ public class BigQueryStorageWriteApiSchemaTransformProvider
       checkArgument(
           !Strings.isNullOrEmpty(this.getTable()),
           invalidConfigMessage + "Table spec for a BigQuery Write must be specified.");
-      checkNotNull(BigQueryHelpers.parseTableSpec(this.getTable()));
+
+      // if we have an input table spec, validate it
+      if (!this.getTable().equals(DYNAMIC_DESTINATIONS)) {
+        checkNotNull(BigQueryHelpers.parseTableSpec(this.getTable()));
+      }
 
       // validate create and write dispositions
       if (!Strings.isNullOrEmpty(this.getCreateDisposition())) {
@@ -175,6 +195,15 @@ public class BigQueryStorageWriteApiSchemaTransformProvider
         checkArgument(
             !Strings.isNullOrEmpty(this.getErrorHandling().getOutput()),
             invalidConfigMessage + "Output must not be empty if error handling specified.");
+      }
+
+      if (this.getAutoSharding() != null
+          && this.getAutoSharding()
+          && this.getNumStreams() != null) {
+        checkArgument(
+            this.getNumStreams() == 0,
+            invalidConfigMessage
+                + "Cannot set a fixed number of streams when auto-sharding is enabled. Please pick only one of the two options.");
       }
     }
 
@@ -218,10 +247,16 @@ public class BigQueryStorageWriteApiSchemaTransformProvider
     public abstract Boolean getUseAtLeastOnceSemantics();
 
     @SchemaFieldDescription(
-        "This option enables using a dynamically determined number of shards to write to "
+        "This option enables using a dynamically determined number of Storage Write API streams to write to "
             + "BigQuery. Only applicable to unbounded data.")
     @Nullable
     public abstract Boolean getAutoSharding();
+
+    @SchemaFieldDescription(
+        "Specifies the number of write streams that the Storage API sink will use. "
+            + "This parameter is only applicable when writing unbounded data.")
+    @Nullable
+    public abstract Integer getNumStreams();
 
     @SchemaFieldDescription("This option specifies whether and where to output unwritable rows.")
     @Nullable
@@ -242,6 +277,8 @@ public class BigQueryStorageWriteApiSchemaTransformProvider
       public abstract Builder setUseAtLeastOnceSemantics(Boolean use);
 
       public abstract Builder setAutoSharding(Boolean autoSharding);
+
+      public abstract Builder setNumStreams(Integer numStreams);
 
       public abstract Builder setErrorHandling(ErrorHandling errorHandling);
 
@@ -310,24 +347,57 @@ public class BigQueryStorageWriteApiSchemaTransformProvider
       public void process(ProcessContext c) {}
     }
 
+    private static class RowDynamicDestinations extends DynamicDestinations<Row, String> {
+      Schema schema;
+
+      RowDynamicDestinations(Schema schema) {
+        this.schema = schema;
+      }
+
+      @Override
+      public String getDestination(ValueInSingleWindow<Row> element) {
+        return element.getValue().getString("destination");
+      }
+
+      @Override
+      public TableDestination getTable(String destination) {
+        return new TableDestination(destination, null);
+      }
+
+      @Override
+      public TableSchema getSchema(String destination) {
+        return BigQueryUtils.toTableSchema(schema);
+      }
+    }
+
     @Override
     public PCollectionRowTuple expand(PCollectionRowTuple input) {
       // Check that the input exists
       checkArgument(input.has(INPUT_ROWS_TAG), "Missing expected input tag: %s", INPUT_ROWS_TAG);
       PCollection<Row> inputRows = input.get(INPUT_ROWS_TAG);
 
-      BigQueryIO.Write<Row> write = createStorageWriteApiTransform();
+      BigQueryIO.Write<Row> write = createStorageWriteApiTransform(inputRows.getSchema());
 
       if (inputRows.isBounded() == IsBounded.UNBOUNDED) {
         Long triggeringFrequency = configuration.getTriggeringFrequencySeconds();
         Boolean autoSharding = configuration.getAutoSharding();
-        write =
-            write.withTriggeringFrequency(
-                (triggeringFrequency == null || triggeringFrequency <= 0)
-                    ? DEFAULT_TRIGGERING_FREQUENCY
-                    : Duration.standardSeconds(triggeringFrequency));
-        // use default value true for autoSharding if not configured for STORAGE_WRITE_API
-        if (autoSharding == null || autoSharding) {
+        int numStreams = configuration.getNumStreams() == null ? 0 : configuration.getNumStreams();
+
+        boolean useAtLeastOnceSemantics =
+            configuration.getUseAtLeastOnceSemantics() != null
+                && configuration.getUseAtLeastOnceSemantics();
+        // Triggering frequency is only applicable for exactly-once
+        if (!useAtLeastOnceSemantics) {
+          write =
+              write.withTriggeringFrequency(
+                  (triggeringFrequency == null || triggeringFrequency <= 0)
+                      ? DEFAULT_TRIGGERING_FREQUENCY
+                      : Duration.standardSeconds(triggeringFrequency));
+        }
+        // set num streams if specified, otherwise default to autoSharding
+        if (numStreams > 0) {
+          write = write.withNumStorageWriteApiStreams(numStreams);
+        } else if (autoSharding == null || autoSharding) {
           write = write.withAutoSharding();
         }
       }
@@ -388,7 +458,7 @@ public class BigQueryStorageWriteApiSchemaTransformProvider
       }
     }
 
-    BigQueryIO.Write<Row> createStorageWriteApiTransform() {
+    BigQueryIO.Write<Row> createStorageWriteApiTransform(Schema schema) {
       Method writeMethod =
           configuration.getUseAtLeastOnceSemantics() != null
                   && configuration.getUseAtLeastOnceSemantics()
@@ -397,11 +467,22 @@ public class BigQueryStorageWriteApiSchemaTransformProvider
 
       BigQueryIO.Write<Row> write =
           BigQueryIO.<Row>write()
-              .to(configuration.getTable())
               .withMethod(writeMethod)
-              .useBeamSchema()
               .withFormatFunction(BigQueryUtils.toTableRow())
               .withWriteDisposition(WriteDisposition.WRITE_APPEND);
+
+      if (configuration.getTable().equals(DYNAMIC_DESTINATIONS)) {
+        checkArgument(
+            schema.getFieldNames().equals(Arrays.asList("destination", "record")),
+            "When writing to dynamic destinations, we expect Row Schema with a "
+                + "\"destination\" string field and a \"record\" Row field.");
+        write =
+            write
+                .to(new RowDynamicDestinations(schema.getField("record").getType().getRowSchema()))
+                .withFormatFunction(row -> BigQueryUtils.toTableRow(row.getRow("record")));
+      } else {
+        write = write.to(configuration.getTable()).useBeamSchema();
+      }
 
       if (!Strings.isNullOrEmpty(configuration.getCreateDisposition())) {
         CreateDisposition createDisposition =

@@ -20,6 +20,7 @@ import argparse
 import yaml
 
 import apache_beam as beam
+from apache_beam.io.filesystems import FileSystems
 from apache_beam.typehints.schemas import LogicalType
 from apache_beam.typehints.schemas import MillisInstant
 from apache_beam.yaml import yaml_transform
@@ -31,10 +32,19 @@ LogicalType.register_logical_type(MillisInstant)
 def _configure_parser(argv):
   parser = argparse.ArgumentParser()
   parser.add_argument(
-      '--pipeline_spec', help='A yaml description of the pipeline to run.')
+      '--pipeline_spec',
+      '--yaml_pipeline',
+      help='A yaml description of the pipeline to run.')
   parser.add_argument(
       '--pipeline_spec_file',
+      '--yaml_pipeline_file',
       help='A file containing a yaml description of the pipeline to run.')
+  parser.add_argument(
+      '--json_schema_validation',
+      default='generic',
+      help='none: do no pipeline validation against the schema; '
+      'generic: validate the pipeline shape, but not individual transforms; '
+      'per_transform: also validate the config of known transforms')
   return parser.parse_known_args(argv)
 
 
@@ -43,29 +53,32 @@ def _pipeline_spec_from_args(known_args):
     raise ValueError(
         "Exactly one of pipeline_spec or pipeline_spec_file must be set.")
   elif known_args.pipeline_spec_file:
-    with open(known_args.pipeline_spec_file) as fin:
-      pipeline_yaml = fin.read()
+    with FileSystems.open(known_args.pipeline_spec_file) as fin:
+      pipeline_yaml = fin.read().decode()
   elif known_args.pipeline_spec:
     pipeline_yaml = known_args.pipeline_spec
   else:
     raise ValueError(
         "Exactly one of pipeline_spec or pipeline_spec_file must be set.")
 
-  return yaml.load(pipeline_yaml, Loader=yaml_transform.SafeLineLoader)
+  return pipeline_yaml
 
 
 def run(argv=None):
-  yaml_transform._LOGGER.setLevel('INFO')
   known_args, pipeline_args = _configure_parser(argv)
-  pipeline_spec = _pipeline_spec_from_args(known_args)
+  pipeline_yaml = _pipeline_spec_from_args(known_args)
+  pipeline_spec = yaml.load(pipeline_yaml, Loader=yaml_transform.SafeLineLoader)
 
-  with beam.Pipeline(options=beam.options.pipeline_options.PipelineOptions(
-      pipeline_args,
-      pickle_library='cloudpickle',
-      **yaml_transform.SafeLineLoader.strip_metadata(pipeline_spec.get(
-          'options', {})))) as p:
+  with beam.Pipeline(  # linebreak for better yapf formatting
+      options=beam.options.pipeline_options.PipelineOptions(
+          pipeline_args,
+          pickle_library='cloudpickle',
+          **yaml_transform.SafeLineLoader.strip_metadata(pipeline_spec.get(
+              'options', {}))),
+      display_data={'yaml': pipeline_yaml}) as p:
     print("Building pipeline...")
-    yaml_transform.expand_pipeline(p, pipeline_spec)
+    yaml_transform.expand_pipeline(
+        p, pipeline_spec, validate_schema=known_args.json_schema_validation)
     print("Running pipeline...")
 
 

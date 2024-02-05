@@ -59,8 +59,8 @@ import org.apache.beam.sdk.metrics.MetricsEnvironment;
 import org.apache.beam.sdk.options.ExecutorOptions;
 import org.apache.beam.sdk.options.ExperimentalOptions;
 import org.apache.beam.sdk.options.PipelineOptions;
-import org.apache.beam.vendor.grpc.v1p54p0.com.google.protobuf.TextFormat;
-import org.apache.beam.vendor.grpc.v1p54p0.io.grpc.ManagedChannel;
+import org.apache.beam.vendor.grpc.v1p60p1.com.google.protobuf.TextFormat;
+import org.apache.beam.vendor.grpc.v1p60p1.io.grpc.ManagedChannel;
 import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.annotations.VisibleForTesting;
 import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.ImmutableList;
 import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.ImmutableSet;
@@ -311,7 +311,6 @@ public class FnHarness {
               executionStateSampler,
               processWideCache,
               dataSampler);
-      logging.setProcessBundleHandler(processBundleHandler);
 
       BeamFnStatusClient beamFnStatusClient = null;
       if (statusApiServiceDescriptor != null) {
@@ -385,9 +384,10 @@ public class FnHarness {
       }
       processBundleHandler.shutdown();
     } catch (Exception e) {
-      System.out.println("Shutting down harness due to exception: " + e.toString());
+      LOG.error("Shutting down harness due to exception", e);
+      e.printStackTrace();
     } finally {
-      System.out.println("Shutting SDK harness down.");
+      LOG.info("Shutting SDK harness down.");
       executionStateSampler.stop();
       executorService.shutdown();
     }

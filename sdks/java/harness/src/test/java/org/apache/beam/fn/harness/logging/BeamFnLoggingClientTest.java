@@ -38,27 +38,28 @@ import java.util.logging.LogManager;
 import java.util.logging.LogRecord;
 import java.util.logging.Logger;
 import java.util.logging.SimpleFormatter;
+import org.apache.beam.fn.harness.control.ExecutionStateSampler;
 import org.apache.beam.model.fnexecution.v1.BeamFnApi;
 import org.apache.beam.model.fnexecution.v1.BeamFnLoggingGrpc;
 import org.apache.beam.model.pipeline.v1.Endpoints;
 import org.apache.beam.sdk.fn.test.TestStreams;
 import org.apache.beam.sdk.options.PipelineOptionsFactory;
-import org.apache.beam.vendor.grpc.v1p54p0.com.google.protobuf.Struct;
-import org.apache.beam.vendor.grpc.v1p54p0.com.google.protobuf.Timestamp;
-import org.apache.beam.vendor.grpc.v1p54p0.com.google.protobuf.Value;
-import org.apache.beam.vendor.grpc.v1p54p0.io.grpc.CallOptions;
-import org.apache.beam.vendor.grpc.v1p54p0.io.grpc.Channel;
-import org.apache.beam.vendor.grpc.v1p54p0.io.grpc.ClientCall;
-import org.apache.beam.vendor.grpc.v1p54p0.io.grpc.ClientInterceptor;
-import org.apache.beam.vendor.grpc.v1p54p0.io.grpc.ForwardingClientCall;
-import org.apache.beam.vendor.grpc.v1p54p0.io.grpc.ManagedChannel;
-import org.apache.beam.vendor.grpc.v1p54p0.io.grpc.MethodDescriptor;
-import org.apache.beam.vendor.grpc.v1p54p0.io.grpc.Server;
-import org.apache.beam.vendor.grpc.v1p54p0.io.grpc.Status;
-import org.apache.beam.vendor.grpc.v1p54p0.io.grpc.inprocess.InProcessChannelBuilder;
-import org.apache.beam.vendor.grpc.v1p54p0.io.grpc.inprocess.InProcessServerBuilder;
-import org.apache.beam.vendor.grpc.v1p54p0.io.grpc.stub.CallStreamObserver;
-import org.apache.beam.vendor.grpc.v1p54p0.io.grpc.stub.StreamObserver;
+import org.apache.beam.vendor.grpc.v1p60p1.com.google.protobuf.Struct;
+import org.apache.beam.vendor.grpc.v1p60p1.com.google.protobuf.Timestamp;
+import org.apache.beam.vendor.grpc.v1p60p1.com.google.protobuf.Value;
+import org.apache.beam.vendor.grpc.v1p60p1.io.grpc.CallOptions;
+import org.apache.beam.vendor.grpc.v1p60p1.io.grpc.Channel;
+import org.apache.beam.vendor.grpc.v1p60p1.io.grpc.ClientCall;
+import org.apache.beam.vendor.grpc.v1p60p1.io.grpc.ClientInterceptor;
+import org.apache.beam.vendor.grpc.v1p60p1.io.grpc.ForwardingClientCall;
+import org.apache.beam.vendor.grpc.v1p60p1.io.grpc.ManagedChannel;
+import org.apache.beam.vendor.grpc.v1p60p1.io.grpc.MethodDescriptor;
+import org.apache.beam.vendor.grpc.v1p60p1.io.grpc.Server;
+import org.apache.beam.vendor.grpc.v1p60p1.io.grpc.Status;
+import org.apache.beam.vendor.grpc.v1p60p1.io.grpc.inprocess.InProcessChannelBuilder;
+import org.apache.beam.vendor.grpc.v1p60p1.io.grpc.inprocess.InProcessServerBuilder;
+import org.apache.beam.vendor.grpc.v1p60p1.io.grpc.stub.CallStreamObserver;
+import org.apache.beam.vendor.grpc.v1p60p1.io.grpc.stub.StreamObserver;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.ExpectedException;
@@ -95,6 +96,7 @@ public class BeamFnLoggingClientTest {
           .setInstructionId("instruction-1")
           .setSeverity(BeamFnApi.LogEntry.Severity.Enum.DEBUG)
           .setMessage("Message")
+          .setTransformId("ptransformId")
           .setThread("12345")
           .setTimestamp(Timestamp.newBuilder().setSeconds(1234567).setNanos(890000000).build())
           .setLogLocation("LoggerName")
@@ -104,6 +106,7 @@ public class BeamFnLoggingClientTest {
           .setInstructionId("instruction-1")
           .setSeverity(BeamFnApi.LogEntry.Severity.Enum.DEBUG)
           .setMessage("testMdcValue:Message")
+          .setTransformId("ptransformId")
           .setCustomData(
               Struct.newBuilder()
                   .putFields(
@@ -117,6 +120,7 @@ public class BeamFnLoggingClientTest {
           .setInstructionId("instruction-1")
           .setSeverity(BeamFnApi.LogEntry.Severity.Enum.WARN)
           .setMessage("MessageWithException")
+          .setTransformId("errorPtransformId")
           .setTrace(getStackTraceAsString(TEST_RECORD_WITH_EXCEPTION.getThrown()))
           .setThread("12345")
           .setTimestamp(Timestamp.newBuilder().setSeconds(1234567).setNanos(890000000).build())
@@ -126,7 +130,16 @@ public class BeamFnLoggingClientTest {
 
   @Test
   public void testLogging() throws Exception {
+    ExecutionStateSampler sampler =
+        new ExecutionStateSampler(PipelineOptionsFactory.create(), null);
+    ExecutionStateSampler.ExecutionStateTracker stateTracker = sampler.create();
+    ExecutionStateSampler.ExecutionState state =
+        stateTracker.create("shortId", "ptransformId", "ptransformIdName", "process");
+    state.activate();
+
     BeamFnLoggingMDC.setInstructionId("instruction-1");
+    BeamFnLoggingMDC.setStateTracker(stateTracker);
+
     AtomicBoolean clientClosedStream = new AtomicBoolean();
     Collection<BeamFnApi.LogEntry> values = new ConcurrentLinkedQueue<>();
     AtomicReference<StreamObserver<BeamFnApi.LogControl>> outboundServerObserver =
@@ -188,7 +201,14 @@ public class BeamFnLoggingClientTest {
       rootLogger.log(FILTERED_RECORD);
       // Should not be filtered because the default log level override for ConfiguredLogger is DEBUG
       configuredLogger.log(TEST_RECORD);
+
+      // Simulate an exception. This sets an internal error state where the PTransform should come
+      // from.
+      ExecutionStateSampler.ExecutionState errorState =
+          stateTracker.create("shortId", "errorPtransformId", "errorPtransformIdName", "process");
+      errorState.activate();
       configuredLogger.log(TEST_RECORD_WITH_EXCEPTION);
+      errorState.deactivate();
 
       // Ensure that configuring a custom formatter on the logging handler will be honored.
       for (Handler handler : rootLogger.getHandlers()) {

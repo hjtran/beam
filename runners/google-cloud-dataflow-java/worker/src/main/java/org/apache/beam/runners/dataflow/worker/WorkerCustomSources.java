@@ -61,7 +61,7 @@ import org.apache.beam.sdk.util.BackOff;
 import org.apache.beam.sdk.util.FluentBackoff;
 import org.apache.beam.sdk.util.WindowedValue;
 import org.apache.beam.sdk.values.ValueWithRecordId;
-import org.apache.beam.vendor.grpc.v1p54p0.com.google.protobuf.ByteString;
+import org.apache.beam.vendor.grpc.v1p60p1.com.google.protobuf.ByteString;
 import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.annotations.VisibleForTesting;
 import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.ImmutableList;
 import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.ImmutableMap;
@@ -776,6 +776,9 @@ public class WorkerCustomSources {
 
   private static class UnboundedReaderIterator<T>
       extends NativeReader.NativeReaderIterator<WindowedValue<ValueWithRecordId<T>>> {
+    // Do not close reader. The reader is cached in StreamingModeExecutionContext.readerCache, and
+    // will be reused until the cache is evicted, expired or invalidated.
+    // See UnboundedReader#iterator().
     private final UnboundedSource.UnboundedReader<T> reader;
     private final StreamingModeExecutionContext context;
     private final boolean started;
@@ -833,7 +836,8 @@ public class WorkerCustomSources {
       while (true) {
         if (elemsRead >= maxElems
             || Instant.now().isAfter(endTime)
-            || context.isSinkFullHintSet()) {
+            || context.isSinkFullHintSet()
+            || context.workIsFailed()) {
           return false;
         }
         try {
@@ -862,7 +866,9 @@ public class WorkerCustomSources {
     }
 
     @Override
-    public void close() {}
+    public void close() {
+      // Don't close reader.
+    }
 
     @Override
     public NativeReader.Progress getProgress() {

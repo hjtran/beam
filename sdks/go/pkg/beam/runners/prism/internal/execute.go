@@ -17,9 +17,11 @@ package internal
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"sort"
+	"sync/atomic"
 	"time"
 
 	"github.com/apache/beam/sdks/v2/go/pkg/beam/core/graph/mtime"
@@ -31,6 +33,7 @@ import (
 	"github.com/apache/beam/sdks/v2/go/pkg/beam/runners/prism/internal/worker"
 	"golang.org/x/exp/maps"
 	"golang.org/x/exp/slog"
+	"golang.org/x/sync/errgroup"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -46,15 +49,14 @@ func RunPipeline(j *jobservices.Job) {
 	// here, we only want and need the go one, operating
 	// in loopback mode.
 	envs := j.Pipeline.GetComponents().GetEnvironments()
-	if len(envs) != 1 {
-		j.Failed(fmt.Errorf("unable to execute multi-environment pipelines;\npipeline has environments: %+v", envs))
-		return
-	}
-	env, _ := getOnlyPair(envs)
-	wk, err := makeWorker(env, j)
-	if err != nil {
-		j.Failed(err)
-		return
+	wks := map[string]*worker.W{}
+	for envID := range envs {
+		wk, err := makeWorker(envID, j)
+		if err != nil {
+			j.Failed(err)
+			return
+		}
+		wks[envID] = wk
 	}
 	// When this function exits, we cancel the context to clear
 	// any related job resources.
@@ -65,14 +67,18 @@ func RunPipeline(j *jobservices.Job) {
 	j.SendMsg("running " + j.String())
 	j.Running()
 
-	if err := executePipeline(j.RootCtx, wk, j); err != nil {
+	if err := executePipeline(j.RootCtx, wks, j); err != nil {
 		j.Failed(err)
 		return
 	}
-	j.SendMsg("pipeline completed " + j.String())
 
-	// Stop the worker.
-	wk.Stop()
+	if errors.Is(context.Cause(j.RootCtx), jobservices.ErrCancel) {
+		j.SendMsg("pipeline canceled " + j.String())
+		j.Canceled()
+		return
+	}
+
+	j.SendMsg("pipeline completed " + j.String())
 
 	j.SendMsg("terminating " + j.String())
 	j.Done()
@@ -81,17 +87,21 @@ func RunPipeline(j *jobservices.Job) {
 // makeWorker creates a worker for that environment.
 func makeWorker(env string, j *jobservices.Job) (*worker.W, error) {
 	wk := worker.New(j.String()+"_"+env, env)
+
 	wk.EnvPb = j.Pipeline.GetComponents().GetEnvironments()[env]
+	wk.PipelineOptions = j.PipelineOptions()
 	wk.JobKey = j.JobKey()
 	wk.ArtifactEndpoint = j.ArtifactEndpoint()
+
 	go wk.Serve()
+
 	if err := runEnvironment(j.RootCtx, j, env, wk); err != nil {
 		return nil, fmt.Errorf("failed to start environment %v for job %v: %w", env, j, err)
 	}
 	// Check for connection succeeding after we've created the environment successfully.
 	timeout := 1 * time.Minute
 	time.AfterFunc(timeout, func() {
-		if wk.Connected() {
+		if wk.Connected() || wk.Stopped() {
 			return
 		}
 		err := fmt.Errorf("prism %v didn't get control connection to %v after %v", wk, wk.Endpoint(), timeout)
@@ -103,7 +113,6 @@ func makeWorker(env string, j *jobservices.Job) (*worker.W, error) {
 
 type transformExecuter interface {
 	ExecuteUrns() []string
-	ExecuteWith(t *pipepb.PTransform) string
 	ExecuteTransform(stageID, tid string, t *pipepb.PTransform, comps *pipepb.Components, watermark mtime.Time, data [][]byte) *worker.B
 }
 
@@ -111,7 +120,7 @@ type processor struct {
 	transformExecuters map[string]transformExecuter
 }
 
-func executePipeline(ctx context.Context, wk *worker.W, j *jobservices.Job) error {
+func executePipeline(ctx context.Context, wks map[string]*worker.W, j *jobservices.Job) error {
 	pipeline := j.Pipeline
 	comps := proto.Clone(pipeline.GetComponents()).(*pipepb.Components)
 
@@ -146,7 +155,7 @@ func executePipeline(ctx context.Context, wk *worker.W, j *jobservices.Job) erro
 
 	prepro := newPreprocessor(preppers)
 
-	topo := prepro.preProcessGraph(comps)
+	topo := prepro.preProcessGraph(comps, j)
 	ts := comps.GetTransforms()
 
 	em := engine.NewElementManager(engine.Config{})
@@ -154,22 +163,18 @@ func executePipeline(ctx context.Context, wk *worker.W, j *jobservices.Job) erro
 	// TODO move this loop and code into the preprocessor instead.
 	stages := map[string]*stage{}
 	var impulses []string
-	for _, stage := range topo {
+
+	for i, stage := range topo {
 		tid := stage.transforms[0]
 		t := ts[tid]
 		urn := t.GetSpec().GetUrn()
 		stage.exe = proc.transformExecuters[urn]
 
-		// Stopgap until everythinng's moved to handlers.
-		stage.envID = t.GetEnvironmentId()
-		if stage.exe != nil {
-			stage.envID = stage.exe.ExecuteWith(t)
-		}
-		stage.ID = wk.NextStage()
+		stage.ID = fmt.Sprintf("stage-%03d", i)
+		wk := wks[stage.envID]
 
 		switch stage.envID {
 		case "": // Runner Transforms
-
 			var onlyOut string
 			for _, out := range t.GetOutputs() {
 				onlyOut = out
@@ -182,11 +187,16 @@ func executePipeline(ctx context.Context, wk *worker.W, j *jobservices.Job) erro
 			ed := collectionPullDecoder(col.GetCoderId(), coders, comps)
 			wDec, wEnc := getWindowValueCoders(comps, col, coders)
 
+			var kd func(io.Reader) []byte
+			if kcid, ok := extractKVCoderID(col.GetCoderId(), coders); ok {
+				kd = collectionPullDecoder(kcid, coders, comps)
+			}
 			stage.OutputsToCoders[onlyOut] = engine.PColInfo{
 				GlobalID: onlyOut,
 				WDec:     wDec,
 				WEnc:     wEnc,
 				EDec:     ed,
+				KeyDec:   kd,
 			}
 
 			// There's either 0, 1 or many inputs, but they should be all the same
@@ -206,39 +216,46 @@ func executePipeline(ctx context.Context, wk *worker.W, j *jobservices.Job) erro
 
 			switch urn {
 			case urns.TransformGBK:
-				em.AddStage(stage.ID, []string{getOnlyValue(t.GetInputs())}, nil, []string{getOnlyValue(t.GetOutputs())})
+				em.AddStage(stage.ID, []string{getOnlyValue(t.GetInputs())}, []string{getOnlyValue(t.GetOutputs())}, nil)
 				for _, global := range t.GetInputs() {
 					col := comps.GetPcollections()[global]
 					ed := collectionPullDecoder(col.GetCoderId(), coders, comps)
 					wDec, wEnc := getWindowValueCoders(comps, col, coders)
+
+					var kd func(io.Reader) []byte
+					if kcid, ok := extractKVCoderID(col.GetCoderId(), coders); ok {
+						kd = collectionPullDecoder(kcid, coders, comps)
+					}
 					stage.inputInfo = engine.PColInfo{
 						GlobalID: global,
 						WDec:     wDec,
 						WEnc:     wEnc,
 						EDec:     ed,
+						KeyDec:   kd,
 					}
 				}
 				em.StageAggregates(stage.ID)
 			case urns.TransformImpulse:
 				impulses = append(impulses, stage.ID)
-				em.AddStage(stage.ID, nil, nil, []string{getOnlyValue(t.GetOutputs())})
+				em.AddStage(stage.ID, nil, []string{getOnlyValue(t.GetOutputs())}, nil)
 			case urns.TransformFlatten:
 				inputs := maps.Values(t.GetInputs())
 				sort.Strings(inputs)
-				em.AddStage(stage.ID, inputs, nil, []string{getOnlyValue(t.GetOutputs())})
+				em.AddStage(stage.ID, inputs, []string{getOnlyValue(t.GetOutputs())}, nil)
 			}
 			stages[stage.ID] = stage
-			wk.Descriptors[stage.ID] = stage.desc
 		case wk.Env:
-			// Great! this is for this environment. // Broken abstraction.
-			if err := buildDescriptor(stage, comps, wk); err != nil {
+			if err := buildDescriptor(stage, comps, wk, em); err != nil {
 				return fmt.Errorf("prism error building stage %v: \n%w", stage.ID, err)
 			}
 			stages[stage.ID] = stage
 			slog.Debug("pipelineBuild", slog.Group("stage", slog.String("ID", stage.ID), slog.String("transformName", t.GetUniqueName())))
 			outputs := maps.Keys(stage.OutputsToCoders)
 			sort.Strings(outputs)
-			em.AddStage(stage.ID, []string{stage.primaryInput}, stage.sides, outputs)
+			em.AddStage(stage.ID, []string{stage.primaryInput}, outputs, stage.sideInputs)
+			if stage.stateful {
+				em.StageStateful(stage.ID)
+			}
 		default:
 			err := fmt.Errorf("unknown environment[%v]", t.GetEnvironmentId())
 			slog.Error("Execute", err)
@@ -251,32 +268,34 @@ func executePipeline(ctx context.Context, wk *worker.W, j *jobservices.Job) erro
 		em.Impulse(id)
 	}
 
-	// Use a channel to limit max parallelism for the pipeline.
-	maxParallelism := make(chan struct{}, 8)
-	// Execute stages here
-	bundleFailed := make(chan error)
-	bundles := em.Bundles(ctx, wk.NextInst)
+	// Use an errgroup to limit max parallelism for the pipeline.
+	eg, egctx := errgroup.WithContext(ctx)
+	eg.SetLimit(8)
+
+	var instID uint64
+	bundles := em.Bundles(egctx, func() string {
+		return fmt.Sprintf("inst%03d", atomic.AddUint64(&instID, 1))
+	})
 	for {
 		select {
 		case <-ctx.Done():
 			return context.Cause(ctx)
 		case rb, ok := <-bundles:
 			if !ok {
-				slog.Debug("pipeline done!", slog.String("job", j.String()))
-				return nil
+				err := eg.Wait()
+				slog.Debug("pipeline done!", slog.String("job", j.String()), slog.Any("error", err))
+				return err
 			}
-			maxParallelism <- struct{}{}
-			go func(rb engine.RunBundle) {
-				defer func() { <-maxParallelism }()
+			eg.Go(func() error {
 				s := stages[rb.StageID]
+				wk := wks[s.envID]
 				if err := s.Execute(ctx, j, wk, comps, em, rb); err != nil {
 					// Ensure we clean up on bundle failure
 					em.FailBundle(rb)
-					bundleFailed <- err
+					return err
 				}
-			}(rb)
-		case err := <-bundleFailed:
-			return err
+				return nil
+			})
 		}
 	}
 }
@@ -287,6 +306,14 @@ func collectionPullDecoder(coldCId string, coders map[string]*pipepb.Coder, comp
 		panic(err)
 	}
 	return pullDecoder(coders[cID], coders)
+}
+
+func extractKVCoderID(coldCId string, coders map[string]*pipepb.Coder) (string, bool) {
+	c := coders[coldCId]
+	if c.GetSpec().GetUrn() == urns.CoderKV {
+		return c.GetComponentCoderIds()[0], true
+	}
+	return "", false
 }
 
 func getWindowValueCoders(comps *pipepb.Components, col *pipepb.PCollection, coders map[string]*pipepb.Coder) (exec.WindowDecoder, exec.WindowEncoder) {

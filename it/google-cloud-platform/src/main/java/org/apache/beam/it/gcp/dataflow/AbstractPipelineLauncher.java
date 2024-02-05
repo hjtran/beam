@@ -22,6 +22,7 @@ import static org.apache.beam.it.common.PipelineLauncher.JobState.FAILED;
 import static org.apache.beam.it.common.PipelineLauncher.JobState.PENDING_STATES;
 import static org.apache.beam.it.common.logging.LogStrings.formatForLogging;
 import static org.apache.beam.it.common.utils.RetryUtil.clientRetryPolicy;
+import static org.apache.beam.sdk.util.Preconditions.checkStateNotNull;
 
 import com.google.api.client.util.ArrayMap;
 import com.google.api.services.dataflow.Dataflow;
@@ -58,6 +59,11 @@ public abstract class AbstractPipelineLauncher implements PipelineLauncher {
 
   private static final Logger LOG = LoggerFactory.getLogger(AbstractPipelineLauncher.class);
   private static final Pattern CURRENT_METRICS = Pattern.compile(".*Current.*");
+  public static final String LEGACY_RUNNER = "Dataflow Legacy Runner";
+  public static final String RUNNER_V2 = "Dataflow Runner V2";
+  public static final String PARAM_RUNNER = "runner";
+  public static final String PARAM_JOB_TYPE = "jobType";
+  public static final String PARAM_JOB_ID = "jobId";
 
   protected final List<String> launchedJobs = new ArrayList<>();
 
@@ -210,10 +216,18 @@ public abstract class AbstractPipelineLauncher implements PipelineLauncher {
         // currently, reporting distribution metrics as 4 separate scalar metrics
         @SuppressWarnings("rawtypes")
         ArrayMap distributionMap = (ArrayMap) metricUpdate.getDistribution();
-        result.put(metricName + "_COUNT", ((Number) distributionMap.get("count")).doubleValue());
-        result.put(metricName + "_MIN", ((Number) distributionMap.get("min")).doubleValue());
-        result.put(metricName + "_MAX", ((Number) distributionMap.get("max")).doubleValue());
-        result.put(metricName + "_SUM", ((Number) distributionMap.get("sum")).doubleValue());
+        result.put(
+            metricName + "_COUNT",
+            checkStateNotNull(((Number) distributionMap.get("count"))).doubleValue());
+        result.put(
+            metricName + "_MIN",
+            checkStateNotNull(((Number) distributionMap.get("min"))).doubleValue());
+        result.put(
+            metricName + "_MAX",
+            checkStateNotNull(((Number) distributionMap.get("max"))).doubleValue());
+        result.put(
+            metricName + "_SUM",
+            checkStateNotNull(((Number) distributionMap.get("sum"))).doubleValue());
       } else if (metricUpdate.getGauge() != null) {
         LOG.warn("Gauge metric {} cannot be handled.", metricName);
         // not sure how to handle gauge metrics
@@ -244,12 +258,12 @@ public abstract class AbstractPipelineLauncher implements PipelineLauncher {
    */
   protected LaunchInfo.Builder getJobInfoBuilder(LaunchConfig options, JobState state, Job job) {
     Map<String, String> labels = job.getLabels();
-    String runner = "Dataflow Legacy Runner";
+    String runner = LEGACY_RUNNER;
     Environment environment = job.getEnvironment();
     if (environment != null
         && environment.getExperiments() != null
         && environment.getExperiments().contains("use_runner_v2")) {
-      runner = "Dataflow Runner V2";
+      runner = RUNNER_V2;
     }
     LaunchInfo.Builder builder =
         LaunchInfo.builder()
@@ -266,6 +280,10 @@ public abstract class AbstractPipelineLauncher implements PipelineLauncher {
     // tests
     Map<String, String> parameters = new HashMap<>(options.parameters());
     options.environment().forEach((key, val) -> parameters.put(key, val.toString()));
+    // attach basic job info to parameters so that these are exported for load tests
+    parameters.put(PARAM_RUNNER, runner);
+    parameters.put(PARAM_JOB_TYPE, job.getType());
+    parameters.put(PARAM_JOB_ID, job.getId());
     builder.setParameters(ImmutableMap.copyOf(parameters));
     if (labels != null && !labels.isEmpty()) {
       // template job
@@ -298,8 +316,9 @@ public abstract class AbstractPipelineLauncher implements PipelineLauncher {
       throw new RuntimeException(
           String.format(
               "The job failed before launch! For more "
-                  + "information please check if the job log for Job ID: %s, under project %s.",
-              jobId, project));
+                  + "information please check the job log at "
+                  + "https://console.cloud.google.com/dataflow/jobs/%s/%s?project=%s.",
+              region, jobId, project));
     }
     return state;
   }

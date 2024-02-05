@@ -36,7 +36,7 @@ import org.apache.beam.sdk.util.CoderUtils;
 import org.apache.beam.sdk.values.PBegin;
 import org.apache.beam.sdk.values.PCollection;
 import org.apache.beam.sdk.values.TimestampedValue;
-import org.apache.beam.vendor.grpc.v1p54p0.com.google.protobuf.ByteString;
+import org.apache.beam.vendor.grpc.v1p60p1.com.google.protobuf.ByteString;
 import org.joda.time.Duration;
 import org.joda.time.Instant;
 
@@ -168,7 +168,7 @@ public class TestStreamTranslation {
   /** A translator registered to translate {@link TestStream} objects to protobuf representation. */
   static class TestStreamTranslator implements TransformPayloadTranslator<TestStream<?>> {
     @Override
-    public String getUrn(TestStream<?> transform) {
+    public String getUrn() {
       return TEST_STREAM_TRANSFORM_URN;
     }
 

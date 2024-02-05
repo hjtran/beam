@@ -37,6 +37,7 @@ import com.google.api.services.bigquery.model.TableRow;
 import com.google.api.services.bigquery.model.TableSchema;
 import com.google.api.services.bigquery.model.TimePartitioning;
 import com.google.auto.value.AutoValue;
+import com.google.cloud.bigquery.storage.v1.AppendRowsRequest;
 import com.google.cloud.bigquery.storage.v1.CreateReadSessionRequest;
 import com.google.cloud.bigquery.storage.v1.DataFormat;
 import com.google.cloud.bigquery.storage.v1.ReadSession;
@@ -95,7 +96,7 @@ import org.apache.beam.sdk.io.gcp.bigquery.BigQueryServices.JobService;
 import org.apache.beam.sdk.io.gcp.bigquery.BigQueryServices.StorageClient;
 import org.apache.beam.sdk.io.gcp.bigquery.BigQuerySourceBase.ExtractResult;
 import org.apache.beam.sdk.io.gcp.bigquery.DynamicDestinationsHelpers.ConstantSchemaDestinations;
-import org.apache.beam.sdk.io.gcp.bigquery.DynamicDestinationsHelpers.ConstantTimePartitioningDestinations;
+import org.apache.beam.sdk.io.gcp.bigquery.DynamicDestinationsHelpers.ConstantTimePartitioningClusteringDestinations;
 import org.apache.beam.sdk.io.gcp.bigquery.DynamicDestinationsHelpers.SchemaFromViewDestinations;
 import org.apache.beam.sdk.io.gcp.bigquery.DynamicDestinationsHelpers.TableFunctionDestinations;
 import org.apache.beam.sdk.io.gcp.bigquery.PassThroughThenCleanup.CleanupOperation;
@@ -485,8 +486,11 @@ import org.slf4j.LoggerFactory;
  * <h3>Upserts and deletes</h3>
  *
  * The connector also supports streaming row updates to BigQuery, with the following qualifications:
- * - The CREATE_IF_NEEDED CreateDisposition is not supported. Tables must be precreated with primary
- * keys. - Only the STORAGE_WRITE_API_AT_LEAST_ONCE method is supported.
+ *
+ * <p>- Only the STORAGE_WRITE_API_AT_LEAST_ONCE method is supported.
+ *
+ * <p>- If the table is not previously created and CREATE_IF_NEEDED is used, a primary key must be
+ * specified using {@link Write#withPrimaryKey}.
  *
  * <p>Two types of updates are supported. UPSERT replaces the row with the matching primary key or
  * inserts the row if non exists. DELETE removes the row with the matching primary key. Row inserts
@@ -534,8 +538,8 @@ import org.slf4j.LoggerFactory;
  * }</pre>
  *
  * <p>Note that in order to use inserts or deletes, the table must bet set up with a primary key. If
- * the table is not previously created and CREATE_IF_NEEDED is used, a primary key must be
- * specified.
+ * the table is not previously created and CREATE_IF_NEEDED is used, a primary key must be specified
+ * using {@link Write#withPrimaryKey}.
  */
 @SuppressWarnings({
   "nullness" // TODO(https://github.com/apache/beam/issues/20506)
@@ -573,7 +577,7 @@ public class BigQueryIO {
   private static final String DATASET_REGEXP = "[-\\w.]{1,1024}";
 
   /** Regular expression that matches Table IDs. */
-  private static final String TABLE_REGEXP = "[-\\w$@]{1,1024}";
+  private static final String TABLE_REGEXP = "[-\\w$@ ]{1,1024}";
 
   /**
    * Matches table specifications in the form {@code "[project_id]:[dataset_id].[table_id]"} or
@@ -601,7 +605,7 @@ public class BigQueryIO {
    * PCollection<TableRow>} directly to BigQueryIO.Write.
    */
   static final SerializableFunction<TableRow, TableRow> TABLE_ROW_IDENTITY_FORMATTER =
-      SerializableFunctions.identity();;
+      SerializableFunctions.identity();
 
   /**
    * A formatting function that maps a GenericRecord to itself. This allows sending a {@code
@@ -2097,7 +2101,9 @@ public class BigQueryIO {
    * <p>By default, tables will be created if they do not exist, which corresponds to a {@link
    * Write.CreateDisposition#CREATE_IF_NEEDED} disposition that matches the default of BigQuery's
    * Jobs API. A schema must be provided (via {@link Write#withSchema(TableSchema)}), or else the
-   * transform may fail at runtime with an {@link IllegalArgumentException}.
+   * transform may fail at runtime with an {@link IllegalArgumentException}. When updating a
+   * pipeline with a new schema, the existing schmea fields must stay in the same order, or the
+   * pipeline will break.
    *
    * <p>By default, writes require an empty table, which corresponds to a {@link
    * Write.WriteDisposition#WRITE_EMPTY} disposition that matches the default of BigQuery's Jobs
@@ -2143,6 +2149,8 @@ public class BigQueryIO {
         .setMaxRetryJobs(1000)
         .setPropagateSuccessfulStorageApiWrites(false)
         .setDirectWriteProtos(true)
+        .setDefaultMissingValueInterpretation(
+            AppendRowsRequest.MissingValueInterpretation.DEFAULT_VALUE)
         .build();
   }
 
@@ -2164,9 +2172,10 @@ public class BigQueryIO {
    * apply row updates; directly calling {@link Write#withRowMutationInformationFn} is preferred
    * when writing non TableRows types (e.g. {@link #writeGenericRecords} or a custom user type).
    *
-   * <p>This is only supported when using the {@link Write.Method#STORAGE_API_AT_LEAST_ONCE} insert
-   * method and {@link Write.CreateDisposition#CREATE_NEVER}. The tables must be precreated with a
-   * primary key.
+   * <p>This is supported when using the {@link Write.Method#STORAGE_API_AT_LEAST_ONCE} insert
+   * method, and with either {@link Write.CreateDisposition#CREATE_NEVER} or {@link
+   * Write.CreateDisposition#CREATE_IF_NEEDED}. For CREATE_IF_NEEDED, a primary key must be
+   * specified using {@link Write#withPrimaryKey}.
    */
   public static Write<RowMutation> applyRowMutations() {
     return BigQueryIO.<RowMutation>write()
@@ -2222,9 +2231,7 @@ public class BigQueryIO {
        * of load jobs allowed per day, so be careful not to set the triggering frequency too
        * frequent. For more information, see <a
        * href="https://cloud.google.com/bigquery/docs/loading-data-cloud-storage">Loading Data from
-       * Cloud Storage</a>. Note: Load jobs currently do not support BigQuery's <a
-       * href="https://cloud.google.com/bigquery/docs/reference/standard-sql/data-types#json_type">
-       * JSON data type</a>.
+       * Cloud Storage</a>.
        */
       FILE_LOADS,
 
@@ -2326,6 +2333,8 @@ public class BigQueryIO {
     abstract @Nullable String getKmsKey();
 
     abstract @Nullable List<String> getPrimaryKey();
+
+    abstract AppendRowsRequest.MissingValueInterpretation getDefaultMissingValueInterpretation();
 
     abstract Boolean getOptimizeWrites();
 
@@ -2429,6 +2438,9 @@ public class BigQueryIO {
 
       abstract Builder<T> setPrimaryKey(@Nullable List<String> primaryKey);
 
+      abstract Builder<T> setDefaultMissingValueInterpretation(
+          AppendRowsRequest.MissingValueInterpretation missingValueInterpretation);
+
       abstract Builder<T> setOptimizeWrites(Boolean optimizeWrites);
 
       abstract Builder<T> setUseBeamSchema(Boolean useBeamSchema);
@@ -2499,6 +2511,8 @@ public class BigQueryIO {
        * <p>The replacement may occur in multiple steps - for instance by first removing the
        * existing table, then creating a replacement, then filling it in. This is not an atomic
        * operation, and external programs may see the table in any of these intermediate steps.
+       *
+       * <p>Note: This write disposition is only supported for the FILE_LOADS write method.
        */
       WRITE_TRUNCATE,
 
@@ -2525,7 +2539,9 @@ public class BigQueryIO {
      *
      * <p>Note from the BigQuery API doc -- Schema update options are supported in two cases: when
      * writeDisposition is WRITE_APPEND; when writeDisposition is WRITE_TRUNCATE and the destination
-     * table is a partition of a table, specified by partition decorators.
+     * table is a partition of a table, specified by partition decorators. When updating a pipeline
+     * with a new schema, the existing schmea fields must stay in the same order, or the pipeline
+     * will break.
      *
      * @see <a
      *     href="https://cloud.google.com/bigquery/docs/reference/rest/v2/Job#jobconfigurationquery">
@@ -2728,8 +2744,7 @@ public class BigQueryIO {
     }
 
     /**
-     * Specifies the clustering fields to use when writing to a single output table. Can only be
-     * used when {@link#withTimePartitioning(TimePartitioning)} is set. If {@link
+     * Specifies the clustering fields to use when writing to a single output table. If {@link
      * #to(SerializableFunction)} or {@link #to(DynamicDestinations)} is used to write to dynamic
      * tables, the fields here will be ignored; call {@link #withClustering()} instead.
      */
@@ -2785,7 +2800,7 @@ public class BigQueryIO {
     }
 
     /**
-     * Specfies a policy for handling failed inserts.
+     * Specifies a policy for handling failed inserts.
      *
      * <p>Currently this only is allowed when writing an unbounded collection to BigQuery. Bounded
      * collections are written using batch load jobs, so we don't get per-element failures.
@@ -2816,9 +2831,10 @@ public class BigQueryIO {
      * function that determines how a row is applied to BigQuery (upsert, or delete) along with a
      * sequence number for ordering operations.
      *
-     * <p>This is only supported when using the {@link Write.Method#STORAGE_API_AT_LEAST_ONCE}
-     * insert method and {@link Write.CreateDisposition#CREATE_NEVER}. The tables must be precreated
-     * with a primary key.
+     * <p>This is supported when using the {@link Write.Method#STORAGE_API_AT_LEAST_ONCE} insert
+     * method, and with either {@link Write.CreateDisposition#CREATE_NEVER} or {@link
+     * Write.CreateDisposition#CREATE_IF_NEEDED}. For CREATE_IF_NEEDED, a primary key must be
+     * specified using {@link Write#withPrimaryKey}.
      */
     public Write<T> withRowMutationInformationFn(
         SerializableFunction<T, RowMutationInformation> updateFn) {
@@ -2832,7 +2848,7 @@ public class BigQueryIO {
     /*
     When using {@link Write.Method#STORAGE_API} or {@link Write.Method#STORAGE_API_AT_LEAST_ONCE} along with
     {@link BigQueryIO.writeProtos}, the sink will try to write the protos directly to BigQuery without modification.
-    In some cases this is not supported or BigQuery cannot directly interpet the proto. In these cases, the direct
+    In some cases this is not supported or BigQuery cannot directly interpret the proto. In these cases, the direct
     proto write
      */
     public Write<T> withDirectWriteProtos(boolean directWriteProtos) {
@@ -2960,6 +2976,21 @@ public class BigQueryIO {
 
     public Write<T> withPrimaryKey(List<String> primaryKey) {
       return toBuilder().setPrimaryKey(primaryKey).build();
+    }
+
+    /**
+     * Specify how missing values should be interpreted when there is a default value in the schema.
+     * Options are to take the default value or to write an explicit null (not an option of the
+     * field is also required.). Note: this is only used when using one of the storage write API
+     * insert methods.
+     */
+    public Write<T> withDefaultMissingValueInterpretation(
+        AppendRowsRequest.MissingValueInterpretation missingValueInterpretation) {
+      checkArgument(
+          missingValueInterpretation == AppendRowsRequest.MissingValueInterpretation.DEFAULT_VALUE
+              || missingValueInterpretation
+                  == AppendRowsRequest.MissingValueInterpretation.NULL_VALUE);
+      return toBuilder().setDefaultMissingValueInterpretation(missingValueInterpretation).build();
     }
 
     /**
@@ -3250,7 +3281,7 @@ public class BigQueryIO {
         checkArgument(getNumFileShards() == 0, "Number of file shards" + error);
 
         if (getStorageApiTriggeringFrequency(bqOptions) != null) {
-          LOG.warn("Storage API triggering frequency" + error);
+          LOG.warn("Setting a triggering frequency" + error);
         }
         if (getStorageApiNumStreams(bqOptions) != 0) {
           LOG.warn("Setting the number of Storage API streams" + error);
@@ -3266,6 +3297,8 @@ public class BigQueryIO {
         checkArgument(
             !getAutoSchemaUpdate(),
             "withAutoSchemaUpdate only supported when using STORAGE_WRITE_API or STORAGE_API_AT_LEAST_ONCE.");
+      } else if (getWriteDisposition() == WriteDisposition.WRITE_TRUNCATE) {
+        LOG.error("The Storage API sink does not support the WRITE_TRUNCATE write disposition.");
       }
       if (getRowMutationInformationFn() != null) {
         checkArgument(getMethod() == Method.STORAGE_API_AT_LEAST_ONCE);
@@ -3323,9 +3356,10 @@ public class BigQueryIO {
         }
 
         // Wrap with a DynamicDestinations class that will provide the proper TimePartitioning.
-        if (getJsonTimePartitioning() != null) {
+        if (getJsonTimePartitioning() != null
+            || Optional.ofNullable(getClustering()).map(Clustering::getFields).isPresent()) {
           dynamicDestinations =
-              new ConstantTimePartitioningDestinations<>(
+              new ConstantTimePartitioningClusteringDestinations<>(
                   (DynamicDestinations<T, TableDestination>) dynamicDestinations,
                   getJsonTimePartitioning(),
                   StaticValueProvider.of(BigQueryHelpers.toJsonString(getClustering())));
@@ -3539,11 +3573,25 @@ public class BigQueryIO {
             !getPropagateSuccessfulStorageApiWrites(),
             "withPropagateSuccessfulStorageApiWrites only supported when using storage api writes.");
 
-        // Batch load jobs currently support JSON data insertion only with CSV files
+        // Batch load handles wrapped json string value differently than the other methods. Raise a
+        // warning when applies.
         if (getJsonSchema() != null && getJsonSchema().isAccessible()) {
           JsonElement schema = JsonParser.parseString(getJsonSchema().get());
-          if (!schema.getAsJsonObject().keySet().isEmpty()) {
-            validateNoJsonTypeInSchema(schema);
+          if (!schema.getAsJsonObject().keySet().isEmpty() && hasJsonTypeInSchema(schema)) {
+            if (rowWriterFactory.getOutputType() == OutputType.JsonTableRow) {
+              LOG.warn(
+                  "Found JSON type in TableSchema for 'FILE_LOADS' write method. \n"
+                      + "Make sure the TableRow value is a parsed JSON to ensure the read as a "
+                      + "JSON type. Otherwise it will read as a raw (escaped) string.\n"
+                      + "See https://cloud.google.com/bigquery/docs/loading-data-cloud-storage-json#limitations "
+                      + "for limitations.");
+            } else if (rowWriterFactory.getOutputType() == OutputType.AvroGenericRecord) {
+              LOG.warn(
+                  "Found JSON type in TableSchema for 'FILE_LOADS' write method. \n"
+                      + " check steps in https://cloud.google.com/bigquery/docs/loading-data-cloud-storage-avro#extract_json_data_from_avro_data "
+                      + " to ensure the read as a JSON type. Otherwise it will read as a raw "
+                      + "(escaped) string.");
+            }
           }
         }
 
@@ -3681,35 +3729,35 @@ public class BigQueryIO {
                 getAutoSchemaUpdate(),
                 getIgnoreUnknownValues(),
                 getPropagateSuccessfulStorageApiWrites(),
-                getRowMutationInformationFn() != null);
+                getRowMutationInformationFn() != null,
+                getDefaultMissingValueInterpretation());
         return input.apply("StorageApiLoads", storageApiLoads);
       } else {
         throw new RuntimeException("Unexpected write method " + method);
       }
     }
 
-    private void validateNoJsonTypeInSchema(JsonElement schema) {
+    private boolean hasJsonTypeInSchema(JsonElement schema) {
       JsonElement fields = schema.getAsJsonObject().get("fields");
       if (!fields.isJsonArray() || fields.getAsJsonArray().isEmpty()) {
-        return;
+        return false;
       }
 
       JsonArray fieldArray = fields.getAsJsonArray();
 
       for (int i = 0; i < fieldArray.size(); i++) {
         JsonObject field = fieldArray.get(i).getAsJsonObject();
-        checkArgument(
-            !field.get("type").getAsString().equals("JSON"),
-            "Found JSON type in TableSchema. JSON data insertion is currently "
-                + "not supported with 'FILE_LOADS' write method. This is supported with the "
-                + "other write methods, however. For more information, visit: "
-                + "https://cloud.google.com/bigquery/docs/reference/standard-sql/"
-                + "json-data#ingest_json_data");
+        if (field.get("type").getAsString().equals("JSON")) {
+          return true;
+        }
 
         if (field.get("type").getAsString().equals("STRUCT")) {
-          validateNoJsonTypeInSchema(field);
+          if (hasJsonTypeInSchema(field)) {
+            return true;
+          }
         }
       }
+      return false;
     }
 
     @Override

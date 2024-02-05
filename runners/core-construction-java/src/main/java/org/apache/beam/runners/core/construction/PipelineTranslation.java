@@ -56,6 +56,14 @@ public class PipelineTranslation {
       final Pipeline pipeline,
       final SdkComponents components,
       boolean useDeprecatedViewTransforms) {
+    return toProto(pipeline, components, useDeprecatedViewTransforms, true);
+  }
+
+  public static RunnerApi.Pipeline toProto(
+      final Pipeline pipeline,
+      final SdkComponents components,
+      boolean useDeprecatedViewTransforms,
+      boolean upgradeTransforms) {
     final List<String> rootIds = new ArrayList<>();
     pipeline.traverseTopologically(
         new PipelineVisitor.Defaults() {
@@ -102,6 +110,20 @@ public class PipelineTranslation {
       // TODO(JIRA-5649): Don't even emit these transforms in the generated protos.
       res = elideDeprecatedViews(res);
     }
+
+    List<String> urnsToOverride =
+        pipeline.getOptions().as(ExternalTranslationOptions.class).getTransformsToOverride();
+    if (urnsToOverride.size() > 0 && upgradeTransforms) {
+      try (TransformUpgrader upgrader = TransformUpgrader.of()) {
+        res =
+            upgrader.upgradeTransformsViaTransformService(
+                res, urnsToOverride, pipeline.getOptions());
+      } catch (Exception e) {
+        throw new RuntimeException(
+            "Could not override the transforms with URNs " + urnsToOverride, e);
+      }
+    }
+
     // Validate that translation didn't produce an invalid pipeline.
     PipelineValidator.validate(res);
     return res;

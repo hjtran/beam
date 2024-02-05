@@ -26,6 +26,7 @@ import (
 	"github.com/apache/beam/sdks/v2/go/pkg/beam/core/graph/window"
 	"github.com/apache/beam/sdks/v2/go/pkg/beam/core/typex"
 	fnpb "github.com/apache/beam/sdks/v2/go/pkg/beam/model/fnexecution_v1"
+	"github.com/apache/beam/sdks/v2/go/pkg/beam/runners/prism/internal/engine"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/test/bufconn"
@@ -47,18 +48,6 @@ func TestWorker_NextInst(t *testing.T) {
 	}
 	if got, want := len(instIDs), 100; got != want {
 		t.Errorf("calling w.NextInst() got %v unique ids, want %v", got, want)
-	}
-}
-
-func TestWorker_NextStage(t *testing.T) {
-	w := New("test", "testEnv")
-
-	stageIDs := map[string]struct{}{}
-	for i := 0; i < 100; i++ {
-		stageIDs[w.NextStage()] = struct{}{}
-	}
-	if got, want := len(stageIDs), 100; got != want {
-		t.Errorf("calling w.NextStage() got %v unique ids, want %v", got, want)
 	}
 }
 
@@ -189,10 +178,12 @@ func TestWorker_Data_HappyPath(t *testing.T) {
 
 	b := &B{
 		InstID: instID,
-		PBDID:  wk.NextStage(),
-		InputData: [][]byte{
-			{1, 1, 1, 1, 1, 1},
-		},
+		PBDID:  "teststageID",
+		Input: []*engine.Block{
+			{
+				Kind:  engine.BlockData,
+				Bytes: [][]byte{{1, 1, 1, 1, 1, 1}},
+			}},
 		OutputCount: 1,
 	}
 	b.Init()
@@ -220,6 +211,20 @@ func TestWorker_Data_HappyPath(t *testing.T) {
 	if got, want := elements.GetData()[0].GetData(), []byte{1, 1, 1, 1, 1, 1}; !bytes.Equal(got, want) {
 		t.Fatalf("client Data received %v, want %v", got, want)
 	}
+	if got, want := elements.GetData()[0].GetIsLast(), false; got != want {
+		t.Fatalf("client Data received was last: got %v, want %v", got, want)
+	}
+
+	elements, err = dataStream.Recv()
+	if err != nil {
+		t.Fatal("expected 2nd data elements:", err)
+	}
+	if got, want := elements.GetData()[0].GetInstructionId(), b.InstID; got != want {
+		t.Fatalf("couldn't receive data elements ID: got %v, want %v", got, want)
+	}
+	if got, want := elements.GetData()[0].GetData(), []byte(nil); !bytes.Equal(got, want) {
+		t.Fatalf("client Data received %v, want %v", got, want)
+	}
 	if got, want := elements.GetData()[0].GetIsLast(), true; got != want {
 		t.Fatalf("client Data received wasn't last: got %v, want %v", got, want)
 	}
@@ -245,12 +250,10 @@ func TestWorker_State_Iterable(t *testing.T) {
 
 	instID := wk.NextInst()
 	wk.activeInstructions[instID] = &B{
-		IterableSideInputData: map[string]map[string]map[typex.Window][][]byte{
-			"transformID": {
-				"i1": {
-					window.GlobalWindow{}: [][]byte{
-						{42},
-					},
+		IterableSideInputData: map[SideInputKey]map[typex.Window][][]byte{
+			{TransformID: "transformID", Local: "i1"}: {
+				window.GlobalWindow{}: [][]byte{
+					{42},
 				},
 			},
 		},
