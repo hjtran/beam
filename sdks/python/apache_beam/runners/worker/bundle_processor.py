@@ -1393,7 +1393,34 @@ class BeamTransformFactory(object):
 
   def get_input_windowing(self, transform_proto):
     # type: (beam_runner_api_pb2.PTransform) -> Windowing
-    pcoll_id = only_element(transform_proto.inputs.values())
+    def leaf_transforms(transform):
+      leaves = []
+      xforms = [transform]
+      while xforms:
+        xform = xforms.pop()
+        if not xform.subtransforms:
+          leaves.append(xform)
+        else:
+          xforms.extend(self.descriptor.transforms[x] for x in xform.subtransforms)
+      return leaves
+    def side_inputs(transform):
+      result = {}
+      for leaf in leaf_transforms(transform):
+        if leaf.spec.urn == common_urns.primitives.PAR_DO.urn:
+          payload = proto_utils.parse_Bytes(
+            leaf.spec.payload, beam_runner_api_pb2.ParDoPayload)
+          for side_input in payload.side_inputs:
+            result[side_input] = leaf.inputs[side_input]
+      return result
+    def main_input(transform):
+      all_inputs = transform.inputs
+      side_inps = side_inputs(transform)
+      for tag, inp in all_inputs.items():
+        if tag not in side_inps:
+          return inp
+      raise ValueError("No main input found for transform %s" % transform.unique_name)
+
+    pcoll_id = main_input(transform_proto)
     windowing_strategy_id = self.descriptor.pcollections[
         pcoll_id].windowing_strategy_id
     return self.context.windowing_strategies.get_by_id(windowing_strategy_id)
