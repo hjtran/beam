@@ -261,7 +261,7 @@ class Stage(object):
           transforms.append(context.components.transforms[subt])
     sinputs = set()
     for transform in leaves:
-      sinputs.update(side_inputs(transform).values())
+      sinputs.update(side_inputs(transform).keys())
     return sinputs
 
   def has_as_main_input(self, pcoll):
@@ -1281,6 +1281,7 @@ def lift_combiners(stages, context):
     for side_input in side_inputs:
       print('side_input', side_input)
       inputs.pop(side_input, None)
+    print('main_input', inputs)
     windowing = context.components.windowing_strategies[
         context.components.pcollections[only_element(
             list(inputs.values())
