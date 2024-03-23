@@ -249,6 +249,21 @@ class Stage(object):
     for transform in self.transforms:
       yield from side_inputs(transform).values()
 
+  def all_side_inputs(self, context):
+    transforms = self.transforms[:]
+    leaves = []
+    while transforms:
+      transform = transforms.pop()
+      if not transform.subtransforms:
+        leaves.append(transform)
+      else:
+        for subt in transform.subtransforms:
+          transforms.append(context.components.transforms[subt])
+    sinputs = set()
+    for transform in leaves:
+      sinputs.update(side_inputs(transform).values())
+    return sinputs
+
   def has_as_main_input(self, pcoll):
     for transform in self.transforms:
       if transform.spec.urn in PAR_DO_URNS:
@@ -273,6 +288,7 @@ class Stage(object):
         seen_pcolls.add(pcoll)
       new_transforms.append(transform)
     self.transforms = new_transforms
+
 
   def executable_stage_transform(
       self,
@@ -1259,10 +1275,15 @@ def lift_combiners(stages, context):
     else:
       return False
 
-  def can_lift(combine_per_key_transform):
+  def can_lift(combine_per_key_transform, side_inputs):
+    inputs = dict(combine_per_key_transform.inputs)
+    print(side_inputs)
+    for side_input in side_inputs:
+      print('side_input', side_input)
+      inputs.pop(side_input, None)
     windowing = context.components.windowing_strategies[
         context.components.pcollections[only_element(
-            list(combine_per_key_transform.inputs.values())
+            list(inputs.values())
         )].windowing_strategy_id]
     return is_compatible_with_combiner_lifting(windowing.trigger)
 
@@ -1393,7 +1414,8 @@ def lift_combiners(stages, context):
   for stage in stages:
     transform = only_transform(stage.transforms)
     if transform.spec.urn == common_urns.composites.COMBINE_PER_KEY.urn:
-      expansion = lifted_stages if can_lift(transform) else unlifted_stages
+      side_inputs = list(stage.all_side_inputs(context))
+      expansion = lifted_stages if can_lift(transform, side_inputs) else unlifted_stages
       for substage in expansion(stage):
         yield substage
     else:
@@ -2087,6 +2109,12 @@ def side_inputs(transform):
     for side_input in payload.side_inputs:
       result[side_input] = transform.inputs[side_input]
   return result
+
+def leafs(transform):
+  if not transform.subtransforms:
+    return [transform]
+  else:
+    return [leaf for sub in transform.subtransforms for leaf in leafs(sub)]
 
 
 def unique_name(existing, prefix):
