@@ -1275,13 +1275,11 @@ def lift_combiners(stages, context):
     else:
       return False
 
+
   def can_lift(combine_per_key_transform, side_inputs):
     inputs = dict(combine_per_key_transform.inputs)
-    print(side_inputs)
     for side_input in side_inputs:
-      print('side_input', side_input)
       inputs.pop(side_input, None)
-    print('main_input', inputs)
     windowing = context.components.windowing_strategies[
         context.components.pcollections[only_element(
             list(inputs.values())
@@ -1301,9 +1299,13 @@ def lift_combiners(stages, context):
     transform = stage.transforms[0]
     combine_payload = proto_utils.parse_Bytes(
         transform.spec.payload, beam_runner_api_pb2.CombinePayload)
+    inputs = dict(transform.inputs)
+    for side_input in side_inputs:
+      inputs.pop(side_input, None)
+    main_input = only_element(list(inputs.values()))
 
-    input_pcoll = context.components.pcollections[only_element(
-        list(transform.inputs.values()))]
+    input_pcoll = context.components.pcollections[
+        main_input]
     output_pcoll = context.components.pcollections[only_element(
         list(transform.outputs.values()))]
 
