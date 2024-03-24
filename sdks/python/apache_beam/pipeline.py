@@ -335,6 +335,7 @@ class Pipeline(HasDisplayData):
                 replacement_transform_node)
 
           inputs = override.get_replacement_inputs(original_transform_node)
+          print(f"{original_transform_node=}inputs: {inputs}")
           if len(inputs) > 1:
             transform_input = inputs
           elif len(inputs) == 1:

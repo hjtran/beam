@@ -36,9 +36,9 @@ class LiftedCombinePerKey(beam.PTransform):
     if isinstance(combine_fn, _CurriedFn):
       args_to_check = itertools.chain(
           args_to_check, combine_fn.args, combine_fn.kwargs.values())
-    if any(isinstance(arg, ArgumentPlaceholder) for arg in args_to_check):
+    #if any(isinstance(arg, ArgumentPlaceholder) for arg in args_to_check):
       # This isn't implemented in dataflow either...
-      raise NotImplementedError('Deferred CombineFn side inputs.')
+      #raise NotImplementedError('Deferred CombineFn side inputs.')
     self._combine_fn = beam.transforms.combiners.curry_combine_fn(
         combine_fn, args, kwargs)
 

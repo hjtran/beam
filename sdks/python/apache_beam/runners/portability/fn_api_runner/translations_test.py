@@ -52,12 +52,13 @@ class TranslationsTest(unittest.TestCase):
       common_items = (
               pipeline
               | 'Create produce' >> beam.Create([
-        {'🍓', '🥕', '🍌', '🍅', '🌶️'},
-        {'🍇', '🥕', '🥝', '🍅', '🥔'},
-        {'🍉', '🥕', '🍆', '🍅', '🍍'},
-        {'🥑', '🥕', '🌽', '🍅', '🥥'},
-      ])
-              | 'Get common items' >> beam.CombineGlobally(get_common_items,
+                  {'🍓', '🥕', '🍌', '🍅', '🌶️'},
+                  {'🍇', '🥕', '🥝', '🍅', '🥔'},
+                  {'🍉', '🥕', '🍆', '🍅', '🍍'},
+                  {'🥑', '🥕', '🌽', '🍅', '🥥'},
+                ])
+              | beam.WithKeys(lambda x: None)
+              | 'Get common items' >> beam.CombinePerKey(get_common_items,
                                                            side=beam.pvalue.AsSingleton(
                                                              pc))
               | beam.Map(print))

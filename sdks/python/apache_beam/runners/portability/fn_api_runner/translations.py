@@ -1278,6 +1278,8 @@ def lift_combiners(stages, context):
 
   def can_lift(combine_per_key_transform, side_inputs):
     inputs = dict(combine_per_key_transform.inputs)
+    #if side_inputs:
+      #import pdb; pdb.set_trace()
     for side_input in side_inputs:
       inputs.pop(side_input, None)
     windowing = context.components.windowing_strategies[
