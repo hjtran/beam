@@ -249,21 +249,6 @@ class Stage(object):
     for transform in self.transforms:
       yield from side_inputs(transform).values()
 
-  def all_side_inputs(self, context):
-    transforms = self.transforms[:]
-    leaves = []
-    while transforms:
-      transform = transforms.pop()
-      if not transform.subtransforms:
-        leaves.append(transform)
-      else:
-        for subt in transform.subtransforms:
-          transforms.append(context.components.transforms[subt])
-    sinputs = set()
-    for transform in leaves:
-      sinputs.update(side_inputs(transform).keys())
-    return sinputs
-
   def has_as_main_input(self, pcoll):
     for transform in self.transforms:
       if transform.spec.urn in PAR_DO_URNS:
@@ -288,7 +273,6 @@ class Stage(object):
         seen_pcolls.add(pcoll)
       new_transforms.append(transform)
     self.transforms = new_transforms
-
 
   def executable_stage_transform(
       self,
@@ -1275,16 +1259,10 @@ def lift_combiners(stages, context):
     else:
       return False
 
-
-  def can_lift(combine_per_key_transform, side_inputs):
-    inputs = dict(combine_per_key_transform.inputs)
-    #if side_inputs:
-      #import pdb; pdb.set_trace()
-    for side_input in side_inputs:
-      inputs.pop(side_input, None)
+  def can_lift(combine_per_key_transform):
     windowing = context.components.windowing_strategies[
         context.components.pcollections[only_element(
-            list(inputs.values())
+            list(combine_per_key_transform.inputs.values())
         )].windowing_strategy_id]
     return is_compatible_with_combiner_lifting(windowing.trigger)
 
@@ -1301,13 +1279,9 @@ def lift_combiners(stages, context):
     transform = stage.transforms[0]
     combine_payload = proto_utils.parse_Bytes(
         transform.spec.payload, beam_runner_api_pb2.CombinePayload)
-    inputs = dict(transform.inputs)
-    for side_input in side_inputs:
-      inputs.pop(side_input, None)
-    main_input = only_element(list(inputs.values()))
 
-    input_pcoll = context.components.pcollections[
-        main_input]
+    input_pcoll = context.components.pcollections[only_element(
+        list(transform.inputs.values()))]
     output_pcoll = context.components.pcollections[only_element(
         list(transform.outputs.values()))]
 
@@ -1419,8 +1393,7 @@ def lift_combiners(stages, context):
   for stage in stages:
     transform = only_transform(stage.transforms)
     if transform.spec.urn == common_urns.composites.COMBINE_PER_KEY.urn:
-      side_inputs = list(stage.all_side_inputs(context))
-      expansion = lifted_stages if can_lift(transform, side_inputs) else unlifted_stages
+      expansion = lifted_stages if can_lift(transform) else unlifted_stages
       for substage in expansion(stage):
         yield substage
     else:
@@ -2114,12 +2087,6 @@ def side_inputs(transform):
     for side_input in payload.side_inputs:
       result[side_input] = transform.inputs[side_input]
   return result
-
-def leafs(transform):
-  if not transform.subtransforms:
-    return [transform]
-  else:
-    return [leaf for sub in transform.subtransforms for leaf in leafs(sub)]
 
 
 def unique_name(existing, prefix):
