@@ -60,13 +60,34 @@ class _SideOutputsContainer:
 
 ### Validation
 
-`with_side_outputs` validates each kwarg:
+Validation happens in two places:
 
-1. The value must be a `PCollection` — `TypeError` otherwise.
-2. The value's `pipeline` must equal `self.pipeline` — `ValueError` otherwise.
+**At call time (`with_side_outputs`):**
 
-Tag names are validated implicitly by `**` (must be valid identifiers). No
-restriction on overlap with other tag names elsewhere in the graph.
+1. Each value must be a `PCollection` — `TypeError` otherwise.
+2. Each value's `pipeline` must equal `self.pipeline` — `ValueError`
+   otherwise.
+
+Tag names are validated implicitly by `**` (must be valid identifiers).
+Tags with hyphens, spaces, or other punctuation are not supported because
+attribute access (`pcoll.side_outputs.dropped`) is the primary access
+pattern; users with arbitrary string tags should continue to use the
+existing dict-return / `DoOutputsTuple` pattern.
+
+**At apply time (inside `Pipeline._apply_internal` and `Pipeline._replace`):**
+
+3. **Provenance check.** Each side output must be produced by a transform
+   inside the wrapping composite's subtree (i.e. the side output's
+   `producer` must be `current` or a descendant of `current.parts`). This
+   prevents transforms from exposing unrelated PCollections as their
+   outputs, which would corrupt the pipeline graph. Raises `ValueError`
+   if violated.
+
+4. **Tag collision check.** If a side-output tag already exists in
+   `current.outputs`, the value at that tag must be the *same*
+   `PCollection` object as the side output being registered. Otherwise
+   raises `ValueError`. (Silent skip would let `out.side_outputs.foo`
+   disagree with `out.producer.outputs['foo']`.)
 
 ### Access
 
@@ -98,28 +119,45 @@ those side outputs must be registered as real outputs of the wrapping
 graph (visible to runners, the proto, visualization tools, and YAML's
 `Transform.tag` resolution).
 
-The hook is in `Pipeline._apply_internal` (`pipeline.py` ~line 818). The
-existing loop walks the result via `get_named_nested_pvalues` and registers
-each PValue on `current.outputs`, with a special case for `DoOutputsTuple`.
-We add a parallel special case: after registering the main PCollection,
-if it has non-empty `_side_outputs`, iterate them and call
-`current.add_output(side_pcoll, side_tag)` (skipping any tag already present
-in `current.outputs`).
+There are **two** output-registration sites in `pipeline.py`, both of which
+need the new hook:
 
-Pseudocode for the addition:
+1. `Pipeline._apply_internal` (~line 818) — the normal apply path.
+2. `Pipeline._replace` (~line 401–413) — the override / replacement path,
+   which currently only handles plain `PValue`, `dict`, and
+   `DoOutputsTuple` returns. Without an update here, transform overrides
+   would silently drop side outputs.
+
+**Scope:** The hook only fires for the *top-level* returned object. We do
+not walk nested PCollections inside dict/tuple/list returns looking for
+attached side outputs — those are an opt-in, top-level convenience.
+
+**Behavior at the hook:**
 
 ```python
-# Inside _apply_internal, after current.add_output(result, tag):
+# After current.add_output(result, tag), where result is the top-level
+# returned PCollection:
 if isinstance(result, pvalue.PCollection) and result._side_outputs:
     for side_tag, side_pcoll in result._side_outputs.items():
-        if side_tag not in current.outputs:
+        # Provenance check: the side output's producer must be inside
+        # current's subtree.
+        _verify_descendant(side_pcoll, current)
+        # Collision check: same-tag must mean same PCollection.
+        existing = current.outputs.get(side_tag)
+        if existing is not None and existing is not side_pcoll:
+            raise ValueError(
+                f"Side output tag {side_tag!r} conflicts with an existing "
+                f"output of the same transform.")
+        if existing is None:
             current.add_output(side_pcoll, side_tag)
 ```
 
-This is the *only* change to `pipeline.py`.
+`_verify_descendant` walks `current.parts` (and their `parts`, recursively)
+collecting the set of `AppliedPTransform`s, then asserts that
+`side_pcoll.producer` is in that set or is `current` itself.
 
-`add_output` (`pipeline.py:1371`) only sets `self.outputs[tag] = output`; it
-does not modify the side output's `producer`. The side output's true
+`add_output` (`pipeline.py:1371`) only sets `self.outputs[tag] = output`;
+it does not modify the side output's `producer`. The side output's true
 producer (e.g. the inner `ParDo` from `with_outputs`) is preserved, which
 is what we want — the outer composite just additionally lists the side
 output among its outputs. This is the standard pattern for composite
@@ -147,13 +185,25 @@ special code.
 - **Pickling:** `PCollection.__reduce_ex__` already returns
   `_InvalidUnpickledPCollection`. Side outputs ride along with that — no
   change needed.
-- **Proto round-trip:** Side outputs are real outputs on the producer's
-  `AppliedPTransform`, so they're already in the runner API proto. The
-  Python-side `_side_outputs` annotation is *not* serialized. After
-  `from_runner_api`, the reconstructed PCollection will not have
-  `_side_outputs` populated, but the side outputs themselves still exist
-  on their producer transform. This is acceptable; the convenience accessor
-  is a construction-time ergonomic, not a serialized graph property.
+- **Proto round-trip:** Side outputs are real outputs on the wrapping
+  composite's `AppliedPTransform`, so they appear in the runner API proto
+  via `named_outputs()`. The Python-side `_side_outputs` annotation on the
+  returned PCollection is *not* serialized. After `from_runner_api`, the
+  reconstructed PCollection will not have `_side_outputs` populated.
+  **`.side_outputs` is a construction-time ergonomic, not a durable graph
+  property.** Users who need to access side outputs of a deserialized
+  pipeline should walk `AppliedPTransform.outputs` directly. This is
+  documented on `with_side_outputs`.
+
+### Type checking
+
+Beam's composite-boundary type checking (`type_check_outputs` in
+`Pipeline._apply_internal`, ~line 815) inspects the value returned from
+`expand()`. With this proposal, only the *main* PCollection's element type
+participates in that check — attached side outputs are not type-checked
+at the composite boundary. They retain whatever element type their inner
+producer assigned. This matches the behavior of side outputs accessed via
+`DoOutputsTuple` and is documented on `with_side_outputs`.
 
 ### `_SideOutputsContainer` implementation sketch
 
@@ -186,18 +236,18 @@ class _SideOutputsContainer:
   `PCollection._side_outputs` attribute, `PCollection.side_outputs` property,
   `PCollection.with_side_outputs` method.
 - `sdks/python/apache_beam/pipeline.py` — add the side-output registration
-  block inside `_apply_internal`'s result-walking loop.
+  block in two locations: inside `_apply_internal`'s result-walking loop
+  (only for the top-level returned PCollection), and inside `_replace`'s
+  output-handling block. Both call a shared helper for
+  provenance/collision validation.
 - `sdks/python/apache_beam/pvalue_test.py` — unit tests for the container,
-  validation rules, and the `with_side_outputs` copy semantics.
-- New end-to-end test (location TBD by implementation plan; likely in
-  `pvalue_test.py` or `transforms/ptransform_test.py`) verifying that a
-  composite transform returning `with_side_outputs(...)` produces a graph
-  in which the side outputs are accessible from the `AppliedPTransform`'s
-  outputs and from the returned PCollection.
+  call-time validation rules, and the `with_side_outputs` copy semantics.
+- `sdks/python/apache_beam/pipeline_test.py` — end-to-end and graph-level
+  tests (see Testing Strategy below).
 
 ## Testing Strategy
 
-Unit tests:
+**Unit tests (`pvalue_test.py`):**
 
 - `with_side_outputs` returns a copy; original unchanged.
 - Side output access via attribute and index; missing-tag error message
@@ -207,35 +257,52 @@ Unit tests:
 - Empty-side-outputs container behavior.
 - Calling `with_side_outputs` twice replaces (does not merge).
 
-End-to-end test (`TestPipeline` based):
+**Pipeline graph tests (`pipeline_test.py`):**
 
-- A composite `PTransform` whose `expand()` calls
-  `result.with_side_outputs(dropped=...)`.
-- Apply it: `out = pcoll | MyFilter()`.
-- Assert `out.side_outputs.dropped` is a PCollection.
-- Assert the wrapping `AppliedPTransform.outputs` contains both the main
-  output (under `None`) and the `"dropped"` tag.
-- Assert chaining (`out | NextTransform()`) still uses the main output
-  and that the next transform's input is the main PCollection.
-- Materialize and `assert_that` on both the main output and the side
-  output to confirm correctness end-to-end.
+- End-to-end: composite `PTransform` whose `expand()` returns
+  `result.with_side_outputs(dropped=...)`. Apply it, assert
+  `out.side_outputs.dropped` is a PCollection, assert the wrapping
+  `AppliedPTransform.outputs` contains both `None` (main) and `"dropped"`,
+  assert chaining (`out | Next()`) uses the main output. Materialize and
+  `assert_that` on both outputs.
+- Wrapping a `ParDo(...).with_outputs(...)` inside a composite that returns
+  `result.with_side_outputs(...)` (the canonical `MyFilter` example).
+- Provenance violation: returning `with_side_outputs(other=foreign_pcoll)`
+  where `foreign_pcoll` was not produced inside the composite — must raise
+  `ValueError` at apply time.
+- Tag collision with a non-identical PCollection — must raise `ValueError`.
+- Tag collision with the *same* PCollection — must succeed (idempotent).
+- `Pipeline.replace_all`: replacement transform that returns a PCollection
+  with side outputs — assert the side outputs end up registered on the
+  replacement's `AppliedPTransform`.
+- Runner API round-trip: build a pipeline using `with_side_outputs`,
+  serialize via `to_runner_api`, deserialize via `from_runner_api`, and
+  confirm the named outputs survive on the producer's `AppliedPTransform`.
+- Nested-return non-flattening: `expand()` returns a dict containing a
+  PCollection that has `_side_outputs` set — confirm those side outputs
+  are NOT auto-registered (they're only registered when the top-level
+  result is itself the PCollection-with-side-outputs).
 
 ## Risks & Mitigations
 
-- **Risk:** A user attaches side outputs to a PCollection that was *not*
-  produced by their composite transform (e.g. they grab some unrelated
-  PCollection and pass it as a side output). The pipeline graph would
-  then list a foreign PCollection under the composite's outputs.
-  **Mitigation:** `add_output` is idempotent for already-registered tags
-  (we skip if `tag in current.outputs`), so we won't double-register; but
-  we deliberately do *not* validate that side outputs are descendants
-  of the wrapping transform — the user opted in by calling
-  `with_side_outputs`. Document this limitation; consider a future warning.
-
+- **Risk:** A user attaches a foreign PCollection as a side output, which
+  would corrupt the pipeline graph by listing it under the wrong producer.
+  **Mitigation:** Apply-time provenance check (`_verify_descendant`) raises
+  `ValueError` if the side output's `producer` is not `current` or one of
+  its descendants.
+- **Risk:** Tag collision with an existing output of the wrapping
+  transform produces inconsistent state.
+  **Mitigation:** Apply-time collision check raises `ValueError` unless
+  the existing entry refers to the same `PCollection` object (idempotent
+  re-registration).
 - **Risk:** Tag collision with the main output's tag (`None` is the main
-  tag). Kwargs cannot be `None`, so this can't happen accidentally. A
-  user passing `with_side_outputs(main=...)` would create a tag named
-  `"main"` which is fine and matches the proposal's example.
+  tag). Kwargs cannot be `None`, so this can't happen accidentally.
+- **Risk:** Tag flexibility — Beam's existing tag mechanism allows
+  arbitrary strings. `with_side_outputs(**kwargs)` only allows valid
+  Python identifiers. **Mitigation:** Documented limitation; users with
+  arbitrary tags should continue to use the existing dict-return /
+  `DoOutputsTuple` patterns. A future overload could accept a mapping
+  for non-identifier tags.
 
 ## Open Questions (to defer)
 
